@@ -17,29 +17,36 @@ import pandas as pd
 import numpy as np
 import shutil
 import librosa
+import joblib
 import pickle
 from tqdm import tqdm
+from sklearn.cluster import SpectralClustering
 
 # !!!!!!!!!!! import sampling_rate, est ce que c'est le même pour notre base ???
 from resemblyzer.audio import sampling_rate
 
 
 
-def perform_diarization(path, encoder, min_clusters = 2, max_clusters = 10, sampling_rate = sampling_rate):
+def perform_diarization(path, encoder, speakers_model, 
+                        min_clusters = 2, max_clusters = 10, sampling_rate = sampling_rate, sklearn = True):
 
     audio_wav = preprocess_wav(path)
     _, cont_embeds, splitted_wav = encoder.embed_utterance(audio_wav, return_partials=True, rate=16)
-
-    clusterer = SpectralClusterer(min_clusters, max_clusters)
-    labels = clusterer.predict(cont_embeds)
+    speakers_embeddings = encoder.embed_utterance(librosa.load(path)[0])
+    
+    n_speakers = speakers_model.predict(speakers_embeddings.reshape(1, -1))[0]
+    
+    if sklearn :
+        labels = SpectralClustering(n_clusters=n_speakers, assign_labels='discretize').fit_predict(cont_embeds)
+    else :
+        clusterer = SpectralClusterer(min_clusters, max_clusters)
+        labels = clusterer.predict(cont_embeds)
 
 
     def create_labelling(labels, wav_splits, sampling_rate):
         times = [((s.start + s.stop) / 2) / sampling_rate for s in wav_splits]
         labelling = []
         start_time = 0
-
-        labels = clusterer.predict(cont_embeds)
 
         for i,time in enumerate(times):
             if i>0 and labels[i]!=labels[i-1]:
@@ -90,33 +97,34 @@ def predict_from_slice(sliced_audios, model, labels = {0 : "F", 1 : "M"}):
             result_dict.setdefault(speaker_id, []).append(labels[prediction[0]])
     return result_dict
     
-def make_count_prediction (path, encoder, model, min_clusters):
+def make_count_prediction (path, encoder, model, speakers_model, min_clusters = 2):
 
-    path, diarization = perform_diarization(path, encoder, min_clusters)
+    path, diarization = perform_diarization(path, encoder, speakers_model, min_clusters)
     sliced_audios = slice_audio(path, diarization)
     predicted = predict_from_slice(sliced_audios, model)
-    count_speakers = {'F' : 0, 'M' : 0}
+    counted_speakers = {'F' : 0, 'M' : 0}
 
     for speaker_id, prediction_list in predicted.items():
         sex, counts = np.unique(prediction_list, return_counts = True)
-        count_speakers[sex[np.argmax(counts)]] += 1
+        counted_speakers[sex[np.argmax(counts)]] += 1
 
-    return path, count_speakers
+    return path, counted_speakers
 
-def make_all_preds(data_path, model_path = "ADAmodel.pkl", min_clusters = 2):
+def make_all_preds(data_path, models_path = "./models", min_clusters = 2):
     
-    model = pickle.load(open(model_path, 'rb'))
+    model = pickle.load(open(os.path.join(models_path, "ADAmodel.pkl"), 'rb'))
+    speakers_model = joblib.load(os.path.join(models_path, 'speakers.joblib'))
     
     encoder = VoiceEncoder("cpu")
     labels_raw = pd.read_excel(os.path.join(data_path, 'referential_movies_subtitles_with_gender.xlsx'))
     labels = labels_raw[['sound_clip_id', 'nb_gender_M', 'nb_gender_F', 'nb_gender_NA', 'nb_gender_NB']]
 
-    results_df = pd.DataFrame(columns = ['sound_clip_id', 'y_M', 'y_F', 'y_NA', 'y_NB', 'pred_F', 'pref_M'])
+    results_df = pd.DataFrame(columns = ['sound_clip_id', 'y_M', 'y_F', 'y_NA', 'y_NB', 'pred_F', 'pred_M'])
 
     for index in tqdm(range(len(labels))):
         filename = str(labels.loc[index, 'sound_clip_id']) + '.wav'
 
-        path, pred_count = make_count_prediction(os.path.join(data_path, filename), encoder, model, min_clusters)
+        path, pred_count = make_count_prediction(os.path.join(data_path, filename), encoder, model, speakers_model, min_clusters)
 
         file_df = pd.DataFrame([[labels_raw.loc[index, 'sound_clip_id'], 
                                  labels_raw.loc[index, 'nb_gender_M'], 
@@ -128,6 +136,24 @@ def make_all_preds(data_path, model_path = "ADAmodel.pkl", min_clusters = 2):
         results_df = pd.concat([results_df, file_df], ignore_index = True)
 
     return results_df
+
+
+def count_speakers(path):
+
+    encoder = VoiceEncoder("cpu")
+    model = pickle.load(open(os.path.join("./models", "ADAmodel.pkl"), 'rb'))
+    speakers_model = joblib.load(os.path.join("./models", 'speakers.joblib'))
+    
+    path, diarization = perform_diarization(path, encoder, speakers_model, min_clusters = 2)
+    sliced_audios = slice_audio(path, diarization)
+    predicted = predict_from_slice(sliced_audios, model)
+    count_speakers = {'F' : 0, 'M' : 0}
+
+    for speaker_id, prediction_list in predicted.items():
+        sex, counts = np.unique(prediction_list, return_counts = True)
+        count_speakers[sex[np.argmax(counts)]] += 1
+
+    return count_speakers
     
 
 
